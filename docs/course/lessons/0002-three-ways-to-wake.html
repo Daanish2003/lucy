@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 2 · Three ways to wake</title>
+<link rel="stylesheet" href="../assets/course.css">
+<script src="../assets/quiz.js" defer></script>
+<script src="../assets/wake-cost.js" defer></script>
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="../MISSION.md">Mission</a> · <a href="0001-the-wake-sleep-lifecycle.html">Lesson 1</a> · Lesson 2 · <a href="../reference/always-on-architecture.html">Cheat sheet</a></nav>
+
+<h1>Three ways to wake an agent</h1>
+<p class="subtitle">Events, schedules and heartbeats. Pick the wrong one and you either miss things or pay to wake up for nothing.</p>
+
+<h2>Warm-up from Lesson 1</h2>
+<p>Answer these from memory before reading on.</p>
+<div class="quiz">
+  <div class="q" data-answer="1">
+    <p class="prompt">A. Where does an always-on agent's memory live between turns?</p>
+    <button class="opt">In the sleeping VM's RAM</button>
+    <button class="opt">In the server's saved state</button>
+    <button class="opt">In the model's context window</button>
+    <button class="opt">In the router's dedupe cache</button>
+    <div class="why">Saved state on the server is the only part that's always on. The VM can always be rebuilt, and the context is rebuilt on every turn.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="prompt">B. What's the last stage of the wake path, before the agent goes back to sleep?</p>
+    <button class="opt">Drop any duplicate wake-ups</button>
+    <button class="opt">Pick the right conversation queue</button>
+    <button class="opt">Restore the computer's snapshot</button>
+    <button class="opt">Decide whether anything's worth saying</button>
+    <div class="why">Router (dedupe, pick conversation) → queue → turn → “anything worth saying?” → send or stay quiet.</div>
+  </div>
+  <p class="quiz-score"></p>
+</div>
+
+<h2>The three mechanisms</h2>
+<p>The lecture lists seven trigger sources.<sup class="cite"><a href="#s1">1</a></sup> Look at how each source tells the agent to wake and they reduce to three mechanisms:</p>
+
+<div class="table-wrap"><table>
+<tr><th></th><th>Event</th><th>Schedule</th><th>Heartbeat</th></tr>
+<tr><td><strong>What wakes it</strong></td><td>Something outside <em>pushes</em> to you: a Slack mention, a GitHub PR, a webhook, a helper finishing</td><td>A clock reaches a time you chose: “weekdays 8:00”</td><td>A fixed tick where the agent asks itself “does anything need attention?”</td></tr>
+<tr><td><strong>The prompt</strong></td><td>The event's payload, which is <em>untrusted</em></td><td>A saved prompt written ahead of time</td><td>A narrow checklist; reply <code>NO_REPLY</code> if nothing needs attention</td></tr>
+<tr><td><strong>Cost grows with</strong></td><td>How many events arrive</td><td>How often it runs</td><td>How often it ticks, <em>even when nothing happened</em></td></tr>
+<tr><td><strong>Main failure</strong></td><td>Floods and retries</td><td>Late starts; work that no longer needs doing</td><td>Paying to wake for nothing; nagging the user</td></tr>
+</table></div>
+
+<h3>1 · Events: the default when the source can push</h3>
+<p>Ambient agents “listen to an event stream and act on it accordingly.”<sup class="cite"><a href="#s2">2</a></sup> Grok Bot routines can start “from an event, such as a Slack message or a GitHub notification.”<sup class="cite"><a href="#s3">3</a></sup> Two production details from Anthropic's routines docs are worth copying. First, <strong>each event gets its own session</strong>: “two PR updates produce two independent sessions.” Second, <strong>the payload arrives wrapped and labelled as untrusted data</strong>, so a leaked trigger token can't give your agent orders.<sup class="cite"><a href="#s4">4</a></sup> Events also arrive in bursts. OpenClaw caps event-driven turns at one every 30 seconds per agent, with a flood guard after five starts within 60 seconds.<sup class="cite"><a href="#s5">5</a></sup> That's the same problem the lecture solves by batching quick messages into one turn.</p>
+
+<h3>2 · Schedules: when time itself is the meaning</h3>
+<p>The lecture stores a routine as a file: <em>prompt + weekdays 8:00</em>. New routines need the user's OK.<sup class="cite"><a href="#s1">1</a></sup> Shipping products put a floor on how often a routine can run. Grok Bot's limit is “at least five minutes apart”;<sup class="cite"><a href="#s3">3</a></sup> Claude routines: “the minimum interval is one hour.” Runs don't start exactly on time either: a 9:00 run “can start several minutes late,” so the docs suggest 9:07.<sup class="cite"><a href="#s4">4</a></sup> Schedules are also how you <em>poll</em> a source that can't push, like a web page with no API.</p>
+
+<h3>3 · Heartbeats: a narrow “anything need me?”</h3>
+<p>OpenClaw runs a heartbeat every 30 minutes by default: a turn in the agent's <em>main</em> session that replies <code>NO_REPLY</code> when nothing needs attention.<sup class="cite"><a href="#s5">5</a></sup> Look at how OpenClaw has <em>narrowed</em> the heartbeat over time:</p>
+<ul>
+<li>Heartbeats now run as a system-owned scheduled job, so there is only one scheduler.</li>
+<li>Recurring checks like “inbox review, calendar sweeps” are supposed to be separate scheduled jobs. The default heartbeat “does not infer recurring work from prior chats, so a default install stays quiet instead of rehashing stale conversation context.”</li>
+<li>To cut cost, <code>isolatedSession</code> “dramatically reduces per-heartbeat token cost” by not resending the conversation history.<sup class="cite"><a href="#s5">5</a></sup></li>
+</ul>
+<div class="callout">
+<p class="label">The lesson in that history</p>
+<p>A heartbeat that is open-ended (“look around and do whatever seems useful”) is expensive and noisy, because it wakes the model to <em>invent</em> work. Mature systems turn each known check into an explicit schedule and keep the heartbeat for the one thing nothing else covers: noticing that something pending needs a nudge.</p>
+</div>
+
+<h2>The decision rule</h2>
+<ol>
+<li><strong>Can the source push?</strong> Use an event.</li>
+<li><strong>Is the trigger a time, or a source you have to poll?</strong> Use a schedule with an explicit saved prompt.</li>
+<li><strong>Only an open-ended “does anything need me?” left?</strong> Use a heartbeat. Keep it narrow, isolated and quiet by default, and limit it to active hours.</li>
+</ol>
+
+<h2>One shape for every wake-up</h2>
+<p>Whatever wakes the agent, the router should receive the same record. The lecture says <em>every wake-up records where it came from</em>.<sup class="cite"><a href="#s1">1</a></sup> In TypeScript, that's the first type you'll write for your product:</p>
+<pre><code>type Wake = {
+  id: string;              // dedupe key: Slack event_id, `${routineId}:${scheduledFor}`, heartbeat tick time
+  source: "owner" | "slack" | "github" | "webhook" | "schedule" | "heartbeat" | "background";
+  conversationId: string;  // picked by the router
+  trusted: boolean;        // the owner's own words vs. outside content
+  payload: string;         // wrapped as untrusted data unless trusted
+  receivedAt: Date;
+};</code></pre>
+<p>Note the dedupe key for a schedule: <code>routineId + scheduledFor</code>. If your cron runner retries a tick, the router sees the same ID and drops it. That's the same unique-ID trick from Lesson 1, applied to time.</p>
+
+<h2>Feel the cost of a heartbeat</h2>
+<p>A heartbeat bills you on every tick. Play with the numbers. The price field is only an example: <a href="https://platform.claude.com/docs/en/about-claude/pricing">check your model's real price</a>. Then try the two cheap fixes, a longer interval and fewer input tokens (an isolated, light-context session).</p>
+<div class="wake-cost"></div>
+<p>Now compare: if the same 1,000 users each got 5 real events a day, you would pay for 5 wake-ups per user instead of 32. Event-driven cost grows with <em>activity</em>, and a heartbeat's grows with <em>the passage of time</em>. That's the lecture's open problem made concrete: <em>“Always-on only works if idle agents are nearly free.”</em><sup class="cite"><a href="#s6">6</a></sup></p>
+
+<hr>
+<h2>Practice: pick the mechanism</h2>
+<p>For each feature of a product you might build, choose how the agent should wake.</p>
+<div class="quiz">
+  <div class="q" data-answer="0">
+    <p class="prompt">1. Reply when a teammate @-mentions the bot in a Slack thread.</p>
+    <button class="opt">Event trigger</button><button class="opt">Fixed schedule</button><button class="opt">Periodic heartbeat</button>
+    <div class="why">Slack pushes the mention. Polling would be slower and pay for empty checks.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="prompt">2. Post a sales-pipeline summary every Monday at 9am.</p>
+    <button class="opt">Event trigger</button><button class="opt">Fixed schedule</button><button class="opt">Periodic heartbeat</button>
+    <div class="why">Time itself is the meaning. Schedule it at 9:07 rather than exactly on the hour.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="prompt">3. Alert the user when a competitor's pricing page changes. The site has no API and no webhooks.</p>
+    <button class="opt">Event trigger</button><button class="opt">Fixed schedule</button><button class="opt">Periodic heartbeat</button>
+    <div class="why">The source can't push, so you poll it, and polling is a schedule with an explicit saved prompt. OpenClaw's docs put recurring checks into scheduled jobs, not the heartbeat.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="prompt">4. Mid-chat, the agent starts a 40-minute research job and must follow up when it finishes.</p>
+    <button class="opt">Event trigger</button><button class="opt">Fixed schedule</button><button class="opt">Periodic heartbeat</button>
+    <div class="why">“Background work finishing” is one of the lecture's trigger sources. The job signals completion, so don't poll for it.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="prompt">5. During waking hours, nudge the user if something they promised across their open threads is going stale.</p>
+    <button class="opt">Event trigger</button><button class="opt">Fixed schedule</button><button class="opt">Periodic heartbeat</button>
+    <div class="why">No single event and no fixed time. It's an open-ended “does anything need me?” over the main session's context. Use a heartbeat, limited to active hours and quiet by default.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="prompt">6. Which mechanism costs money even on a day when nothing at all happens?</p>
+    <button class="opt">Event trigger</button><button class="opt">Fixed schedule</button><button class="opt">Periodic heartbeat</button>
+    <div class="why">A heartbeat ticks no matter what. (A schedule does too, but it runs rarely and only for work you asked for.)</div>
+  </div>
+  <p class="quiz-score"></p>
+</div>
+
+<h3>Free recall: your product</h3>
+<div class="recall">
+<p>Pick one product shape from your mission: a social bot, a personal assistant, or an ops agent. List its three most important wake-ups. For each, name the mechanism, the dedupe <code>id</code> you'd use, and whether its payload is trusted.</p>
+<textarea placeholder="e.g. 1. New support email → event (Gmail push), id = messageId, untrusted…"></textarea>
+<button class="reveal">Reveal an example</button>
+<div class="answer">
+<p><em>Ops agent for a support inbox:</em></p>
+<ol>
+<li>New support email → <strong>event</strong> (mail provider push) · id = message ID · <strong>untrusted</strong>, because a customer wrote it.</li>
+<li>Daily SLA report at 8:07 → <strong>schedule</strong> · id = <code>sla-report:2026-10-17T08:07</code> · trusted, because it's a saved prompt the owner approved.</li>
+<li>Owner types “why is ticket 412 stuck?” → <strong>event</strong> (owner message) · id = client message ID · <strong>trusted</strong>, and it skips the queue.</li>
+</ol>
+<p>Notice there's no heartbeat. Many good products don't need one.</p>
+</div>
+</div>
+<p>Paste your answer to me in the terminal and I'll critique it.</p>
+
+<hr>
+<div class="callout primary-source">
+<p class="label">Primary source</p>
+<p><a href="https://code.claude.com/docs/en/routines#configure-triggers">Claude Code docs: Routines → Configure triggers</a>. A short, real spec for schedule, API and GitHub triggers, including the details that matter in production (minimum interval, late starts, untrusted payload wrapping, one session per event). Then skim <a href="https://github.com/openclaw/openclaw/blob/main/docs/gateway/heartbeat.md">OpenClaw's heartbeat doc</a> to see the heartbeat side.</p>
+</div>
+
+<div class="callout">
+<p class="label">Ask your teacher</p>
+<p>Some good follow-ups: “How do I verify Slack's webhook signature in TypeScript?”, “Gmail push vs. IMAP polling: which do I need?”, or “How would I build the scheduler without a cron server?”</p>
+</div>
+
+<ol class="sources">
+<li id="s1">Robinson, lecture slides “What wakes the agent” and “What the agent knows lives in files”; “How we keep it safe.”</li>
+<li id="s2">Chase, <a href="https://www.langchain.com/blog/introducing-ambient-agents">“Introducing ambient agents,”</a> LangChain.</li>
+<li id="s3">xAI, <a href="https://docs.x.ai/grok-bot/skills-routines-and-automations">Grok Bot: skills, routines and automations</a>.</li>
+<li id="s4">Anthropic, <a href="https://code.claude.com/docs/en/routines">Claude Code routines docs</a>.</li>
+<li id="s5">OpenClaw, <a href="https://github.com/openclaw/openclaw/blob/main/docs/gateway/heartbeat.md">docs/gateway/heartbeat.md</a>.</li>
+<li id="s6">Robinson, slide “Open problems you could work on.”</li>
+</ol>
+
+<div class="next"><a href="0001-the-wake-sleep-lifecycle.html">← Lesson 1</a><a href="0003-the-conversation-queue.html">Lesson 3: The conversation queue →</a></div>
+</main>
+</body>
+</html>

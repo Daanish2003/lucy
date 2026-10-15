@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Always-on architecture cheat sheet</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="../MISSION.md">Mission</a> · Reference · <a href="../lessons/0001-the-wake-sleep-lifecycle.html">Lesson 1</a></nav>
+<h1>Always-on architecture</h1>
+<p class="subtitle">A one-page summary of Lee Robinson's “How always-on agents work” (Stanford CS146S, Oct 2026). All numbers are the lecture's, not general rules.</p>
+
+<h2>Week-one agent → always-on agent</h2>
+<div class="table-wrap"><table>
+<tr><th>Week-one agent</th><th>Always-on agent</th></tr>
+<tr><td>Runs in your terminal</td><td>Runs on a server: survives crashes, deploys, a closed laptop</td></tr>
+<tr><td>Uses your laptop</td><td>Own cloud computer (VM with desktop, browser, files)</td></tr>
+<tr><td>Remembers only <code>messages</code></td><td>Saves state, memory and skills; summarizes old messages</td></tr>
+<tr><td>Prints every reply</td><td>Speaks only through a send tool, so it can stay quiet</td></tr>
+<tr><td>Starts when you type</td><td>Starts on events: messages, schedules, Slack, calls, finished work</td></tr>
+<tr><td>One task, then exits</td><td>Works for months, same memory, many conversations</td></tr>
+</table></div>
+
+<h2>Lifecycle</h2>
+<p><strong>Trigger → router</strong> (dedupe, pick conversation, record source) <strong>→ per-conversation queue</strong> (one turn at a time) <strong>→ turn</strong> (load state, model ↔ tools, save every step) <strong>→ anything worth saying?</strong> (send tool, or stay quiet) <strong>→ idle ~2 min → process stops</strong>.</p>
+<p>The computer is restored only when a tool needs it. It sleeps a few minutes after the last activity, never mid-turn: files sync, then a snapshot is taken, then it stops. Saved state lives in the server database.</p>
+<blockquote>When nothing is happening, nothing runs. Everything that matters is saved, so any trigger can bring it back.</blockquote>
+
+<h2>Choosing a wake mechanism <small>(Lesson 2)</small></h2>
+<ol>
+<li><strong>Source can push?</strong> → <strong>event</strong>. One session per event, untrusted payload, dedupe on the provider's event ID, flood guard and batching.</li>
+<li><strong>Trigger is a time, or a source you have to poll?</strong> → <strong>schedule</strong>. Saved prompt, user-approved. Dedupe on <code>routineId:scheduledFor</code>. Run at :07, not :00.</li>
+<li><strong>Only an open-ended “anything need me?” left?</strong> → <strong>heartbeat</strong>. Keep it narrow, isolated session, active hours only, <code>NO_REPLY</code> by default. Costs money on every tick.</li>
+</ol>
+<p>Products' limits: Grok Bot routines ≥ 5 min apart (≤ 50 per Bot). Claude routines ≥ 1 h. OpenClaw heartbeat 30 min by default; event turns ≥ 30 s apart, flood guard after 5 in 60 s.</p>
+
+<h2>Three tiers</h2>
+<div class="table-wrap"><table>
+<tr><th>Apps &amp; channels</th><th>Server (runs the agent)</th><th>Agent's computer (runs tools)</th></tr>
+<tr><td>Desktop, mobile/web, Slack, email/webhooks/schedules, phone/meetings</td><td>Entry point → queue per conversation → agent loop ↔ model; load/save ↔ database</td><td>Firecracker VM per user → Debian container: file &amp; connector server, command runner, a screen with Chrome per active agent</td></tr>
+</table></div>
+
+<h2>Message sync</h2>
+<ul>
+<li>Client shows the message immediately and assigns a <strong>unique ID</strong>. The server drops IDs it has already seen, so retries are safe.</li>
+<li>Server broadcasts a data-less <strong>“something changed”</strong> signal, and apps fetch from the DB. A lost signal is harmless.</li>
+<li>Updates carry <strong>sequence numbers</strong>. When there's a gap, the app reloads from the DB.</li>
+<li>The owner's 1:1 messages and <strong>Stop</strong> skip the queue and interrupt the turn. Everything else waits in FIFO order, and quick bursts are batched into one turn.</li>
+<li><strong>Queue modes</strong> (OpenClaw): <em>collect</em> (merge into one follow-up turn, 500 ms debounce) · <em>followup</em> (one turn each) · <em>steer</em> (inject at the next model boundary and skip unstarted tool calls; OpenClaw's default) · <em>interrupt</em> (abort, then run the newest).</li>
+<li><strong>Abort ≠ start now.</strong> Wait for the aborted turn to settle before the next one starts. This is safe because every step was saved. (Exercise: <code>build/01-router</code>.)</li>
+</ul>
+
+<h2>Harness</h2>
+<ul>
+<li><strong>SendToUser</strong> is the only way to talk to the user. Thinking stays private and silence is allowed. The last send can end the turn without another model call.</li>
+<li><strong>Purpose-built approval UIs</strong>: password autofill that the model never sees, Allow/Deny cards for payments, full email drafts, reactions.</li>
+<li><strong>Tool schemas on demand</strong>: tool names go in the prompt up front, and details load when needed.</li>
+<li><strong>Cheapest first</strong>: what it already knows → connector API → web search → its signed-in browser → full desktop → ask you. If a connector is broken, ask rather than work around it.</li>
+<li><strong>Main agent + helpers</strong>: each helper gets a full task description and a fresh context, and returns a short report.</li>
+<li><strong>Tool tips</strong>: keep the tool set stable (unavailable tools return an error), keep each description and schema under 4,000 characters, use a dedicated tool to save state, and write errors that say what to do next.</li>
+<li><strong>Safety</strong>: a separate model reviews risky actions (no answer in 15 s means blocked). Email and webhook text is labelled untrusted. Memories are information, not instructions. It asks before messaging people or creating routines. Secrets go in env vars.</li>
+</ul>
+
+<h2>Context engineering</h2>
+<ul>
+<li><strong>Stable prefix</strong> (tools, system prompt with a memory snapshot, first message), then an append-only history, then the newest message (time, what changed, the message itself). This keeps the provider cache warm.</li>
+<li><strong>Treat a cache miss like a bug</strong>: fixed sorted order, each section hashed, tool changes sent as notes, and the cache warmed when the user opens the chat.</li>
+<li><strong>Keep the main context small</strong>: outputs go to files, screenshots and heavy tool work go to helpers, instructions become skills.</li>
+<li><strong>Summarize while idle</strong>: about 10 minutes after a turn over 100k tokens, while the cache is still warm. Keep the last few sent messages word for word.</li>
+<li><strong>Memory tiers</strong>: profile (always in the prompt, ≤100 facts / 4,000 characters) → log (top 30 recent entries) → notes (fade) → search.</li>
+</ul>
+
+<h2>On disk</h2>
+<pre><code>memory/profile.md        always in prompt
+memory/log/2026-10.md    dated facts
+skills/&lt;name&gt;/SKILL.md   "Use this when…", loaded on demand
+routines/morning-brief   prompt + weekdays 8:00</code></pre>
+
+<h2>The new stack</h2>
+<p><em>Web app:</em> server · database · cache · CRUD.<br>
+<em>Agent product:</em> durable workflows · computer use · memory &amp; skills · triggers &amp; scheduled jobs · connectors &amp; auth · text &amp; voice channels · payments &amp; identity · evals &amp; observability.</p>
+
+<h2>Open problems (where a startup can win)</h2>
+<p>Testing long-running agents · correct memory · prompt injection · when to speak · multi-agent coordination · cost (idle ≈ free).</p>
+</main>
+</body>
+</html>

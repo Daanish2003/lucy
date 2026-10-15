@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 1 · The wake–sleep lifecycle</title>
+<link rel="stylesheet" href="../assets/course.css">
+<script src="../assets/quiz.js" defer></script>
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="../MISSION.md">Mission</a> · Lesson 1 · <a href="../reference/always-on-architecture.html">Architecture cheat sheet</a></nav>
+
+<h1>The wake–sleep lifecycle</h1>
+<p class="subtitle">Why an always-on agent is mostly <em>not running</em>, and why that's what makes it a viable product.</p>
+
+<p>You've built this loop before:</p>
+<pre><code>const messages = [system, userMessage];
+while (true) {
+  const reply = await llm(messages, { tools });
+  messages.push(reply);
+  if (!reply.toolCalls.length) { console.log(reply.text); break; }
+  for (const call of reply.toolCalls) messages.push(await runTool(call));
+}</code></pre>
+<p>Lee Robinson opens his Stanford lecture with exactly this loop and one line: <strong>“This agent stops when you close the terminal.”</strong><sup class="cite"><a href="#s1">1</a></sup> Everything else in this course is about what you add around this loop so that it keeps working for months.</p>
+
+<h2>The counter-intuitive core</h2>
+<p>“Always-on” doesn't mean a process spinning 24/7. It means <em>any trigger can bring the agent back</em>. The lecture splits the agent into three things with very different lifetimes:<sup class="cite"><a href="#s2">2</a></sup></p>
+
+<figure>
+<svg viewBox="0 0 640 290" role="img" aria-label="Swim-lane timeline: triggers wake a short-lived agent process; the computer is restored only when a tool needs it; saved state is always on.">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+  <text x="0" y="38" class="lbl">Triggers</text><text x="0" y="52" class="sm">wake it up</text>
+  <text x="0" y="108" class="lbl">Agent process</text><text x="0" y="122" class="sm">lives for one turn</text>
+  <text x="0" y="178" class="lbl">Agent's computer</text><text x="0" y="192" class="sm">sleeps when idle</text>
+  <text x="0" y="248" class="lbl">Saved state</text><text x="0" y="262" class="sm">always on</text>
+
+  <rect x="160" y="22" width="110" height="30" rx="3" class="box"/><text x="215" y="42" text-anchor="middle" class="lbl">Your message</text>
+  <rect x="450" y="22" width="120" height="30" rx="3" class="box"/><text x="510" y="42" text-anchor="middle" class="lbl">Routine at 8:00</text>
+
+  <rect x="160" y="92" width="150" height="34" rx="3" class="box hot"/><text x="235" y="113" text-anchor="middle" class="lbl">load → work → save</text>
+  <line x1="310" y1="109" x2="450" y2="109" class="edge" stroke-dasharray="4 4"/><text x="380" y="100" text-anchor="middle" class="sm">stops after 2 idle min</text>
+  <rect x="450" y="92" width="120" height="34" rx="3" class="box hot"/><text x="510" y="113" text-anchor="middle" class="lbl">routine runs</text>
+
+  <rect x="150" y="162" width="60" height="34" rx="3" class="box"/><text x="180" y="183" text-anchor="middle" class="sm">asleep</text>
+  <rect x="218" y="162" width="140" height="34" rx="3" class="box hot"/><text x="288" y="183" text-anchor="middle" class="lbl">restored for a tool</text>
+  <rect x="366" y="162" width="264" height="34" rx="3" class="box"/><text x="498" y="183" text-anchor="middle" class="sm">stays asleep: the routine needed no tools</text>
+
+  <rect x="150" y="232" width="480" height="34" rx="3" style="fill:var(--fg)"/>
+  <text x="390" y="253" text-anchor="middle" class="lbl" style="fill:var(--bg)">Database: conversations · memory · routines · skills</text>
+
+  <line x1="215" y1="52" x2="215" y2="90" class="edge" marker-end="url(#ah)"/>
+  <line x1="510" y1="52" x2="510" y2="90" class="edge" marker-end="url(#ah)"/>
+  <line x1="270" y1="126" x2="270" y2="160" class="edge hot" stroke-dasharray="3 3" marker-end="url(#ah)"/>
+</svg>
+<figcaption>Redrawn from the lecture slide “How does it stay always on?” The agent process exists only during a turn. The computer wakes only when a tool needs it. Only the saved state lives forever.</figcaption>
+</figure>
+
+<p>The lecture's footer line is the whole idea: <strong>“When nothing is happening, nothing runs. Everything that matters is saved, so any trigger can bring it back.”</strong><sup class="cite"><a href="#s2">2</a></sup> The same talk puts it more bluntly on its own slide: <em>“Save everything on the server. The virtual machine can then always be rebuilt.”</em><sup class="cite"><a href="#s3">3</a></sup></p>
+
+<div class="callout">
+<p class="label">Why this is a business decision, not just engineering</p>
+<p>Among the lecture's open problems: <em>“Always-on only works if idle agents are nearly free and active ones are cheap.”</em><sup class="cite"><a href="#s4">4</a></sup> If each of your users had a process running 24/7, cost would grow with the number of users. With the wake–sleep design, cost grows with the number of wake-ups instead. Your pricing has to follow the same unit.</p>
+</div>
+
+<h2>The wake path</h2>
+<p>So what brings it back? The lecture lists seven trigger sources: you on any app, routines (schedule or webhook), Slack, phone calls or meetings, another agent, background work finishing, and scheduled check-ins. All of them funnel through one path:<sup class="cite"><a href="#s5">5</a></sup></p>
+
+<figure>
+<svg viewBox="0 0 640 170" role="img" aria-label="Triggers flow into a router, then a per-conversation queue, then a decision: send a message or stay quiet.">
+  <defs><marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+  <rect x="0" y="55" width="100" height="56" rx="3" class="box"/><text x="50" y="80" text-anchor="middle" class="lbl">7 trigger</text><text x="50" y="96" text-anchor="middle" class="lbl">sources</text>
+  <rect x="130" y="50" width="130" height="66" rx="3" class="box"/><text x="195" y="74" text-anchor="middle" class="lbl">Router</text><text x="195" y="91" text-anchor="middle" class="sm">drops duplicates,</text><text x="195" y="105" text-anchor="middle" class="sm">picks conversation</text>
+  <rect x="290" y="50" width="130" height="66" rx="3" class="box"/><text x="355" y="74" text-anchor="middle" class="lbl">Conversation queue</text><text x="355" y="98" text-anchor="middle" class="sm">one turn at a time</text>
+  <polygon points="505,40 565,83 505,126 445,83" class="box"/><text x="505" y="80" text-anchor="middle" class="sm">anything worth</text><text x="505" y="94" text-anchor="middle" class="sm">saying?</text>
+  <rect x="560" y="5" width="80" height="40" rx="3" class="box hot"/><text x="600" y="29" text-anchor="middle" class="lbl">Send</text>
+  <rect x="560" y="122" width="80" height="40" rx="3" class="box"/><text x="600" y="146" text-anchor="middle" class="lbl">Stay quiet</text>
+  <line x1="100" y1="83" x2="128" y2="83" class="edge" marker-end="url(#ah2)"/>
+  <line x1="260" y1="83" x2="288" y2="83" class="edge" marker-end="url(#ah2)"/>
+  <line x1="420" y1="83" x2="443" y2="83" class="edge" marker-end="url(#ah2)"/>
+  <path d="M535,62 L585,47" class="edge hot" marker-end="url(#ah2)"/><text x="548" y="48" class="sm">yes</text>
+  <path d="M535,104 L585,120" class="edge" marker-end="url(#ah2)"/><text x="548" y="124" class="sm">no</text>
+</svg>
+<figcaption>Redrawn from “What wakes the agent.” Every wake-up also records where it came from, so the agent knows whether you asked or a routine fired.</figcaption>
+</figure>
+
+<p>Each box exists for a reason you'll hit in production:</p>
+<ul>
+<li><strong>Router drops duplicates.</strong> Webhooks and clients retry. Without deduplication, one Slack mention can run two turns and send two replies.</li>
+<li><strong>One queue per conversation, one turn at a time.</strong> Two turns running at once on the same conversation would both read and write the same state.</li>
+<li><strong>“Anything worth saying?”</strong> The agent talks to you <em>only</em> through a send tool. Its ordinary text stays private, so ending a turn in silence is a legitimate outcome.<sup class="cite"><a href="#s6">6</a></sup> This is the reverse of your week-one loop, which printed every reply.</li>
+</ul>
+
+<h2>It's not just one company's design</h2>
+<p>The lecture's case study is xAI's Grok Bot. Its docs describe routines that keep running with your laptop closed and that are triggered by a schedule or by Slack and GitHub events.<sup class="cite"><a href="#s7">7</a></sup> Anthropic's Managed Agents arrives at the same split from a different angle: the session lives in an append-only log outside the loop, so a crashed harness can call <code>wake(sessionId)</code> and carry on.<sup class="cite"><a href="#s8">8</a></sup> The open-source OpenClaw wakes differently. It uses a fixed <em>heartbeat</em> (every 30 minutes by default) and replies <code>NO_REPLY</code> (formerly <code>HEARTBEAT_OK</code>) when nothing needs attention.<sup class="cite"><a href="#s9">9</a></sup> Event-driven wake-ups versus heartbeats is the trade-off we'll take on next.</p>
+
+<hr>
+<h2>Check yourself</h2>
+<p>Answer without scrolling up. Getting one wrong is useful: it shows you what to reread.</p>
+
+<div class="quiz">
+  <div class="q" data-answer="2">
+    <p class="prompt">1. In the lecture's design, which of these exists only while a turn is running?</p>
+    <button class="opt">The conversation database rows</button>
+    <button class="opt">The user's memory profile</button>
+    <button class="opt">The agent process itself</button>
+    <button class="opt">The routine schedule list</button>
+    <div class="why">The process loads state, works, saves each step, and stops after about 2 idle minutes. Rows, memory and routines live in saved state, which is always on.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="prompt">2. A routine fires at 8:00 and only needs memory and the model, no tools. What does the agent's computer do?</p>
+    <button class="opt">It stays asleep throughout</button>
+    <button class="opt">It boots, then sleeps</button>
+    <button class="opt">It restores its snapshot</button>
+    <button class="opt">It rebuilds from scratch</button>
+    <div class="why">The computer is restored lazily, “when a tool needs it.” A tool-free routine never wakes it, which is a large part of why idle agents can be nearly free.</div>
+  </div>
+  <div class="q" data-answer="3">
+    <p class="prompt">3. Why does the router drop duplicates before anything is queued?</p>
+    <button class="opt">Queues cannot hold duplicate items</button>
+    <button class="opt">The model rejects repeated messages</button>
+    <button class="opt">Duplicates exceed the context window</button>
+    <button class="opt">Retried wake-ups would run twice</button>
+    <div class="why">Networks and webhook senders retry. The lecture gives every message a unique ID so “retries are safe”: the server drops any ID it has already seen.</div>
+  </div>
+  <div class="q" data-answer="1">
+    <p class="prompt">4. A webhook wakes the agent. It checks the situation and finds nothing new. What should it do?</p>
+    <button class="opt">Send a short status update</button>
+    <button class="opt">End the turn without messaging</button>
+    <button class="opt">Print its reasoning to chat</button>
+    <button class="opt">Schedule another check immediately after</button>
+    <div class="why">“Quiet is allowed.” Users only see what goes through the send tool. The lecture lists “when to speak” as an open problem: too many messages are noise.</div>
+  </div>
+  <div class="q" data-answer="2">
+    <p class="prompt">5. Why does each conversation get its own queue that runs one turn at a time?</p>
+    <button class="opt">Providers limit one request per user</button>
+    <button class="opt">Users can only send one message</button>
+    <button class="opt">Two turns could clobber shared state</button>
+    <button class="opt">Queues are cheaper than database rows</button>
+    <div class="why">Concurrent turns on the same conversation would race on its history and memory. Serializing per conversation removes that race, and different conversations can still run in parallel.</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="prompt">6. Per the lecture, always-on only works as a business if…</p>
+    <button class="opt">idle agents are nearly free</button>
+    <button class="opt">every user pays per message</button>
+    <button class="opt">models run on user devices</button>
+    <button class="opt">agents reply within one second</button>
+    <div class="why">From the “Open problems” slide: “idle agents are nearly free and active ones are cheap.” The wake–sleep lifecycle is how you get the first half.</div>
+  </div>
+  <p class="quiz-score"></p>
+</div>
+
+<h3>Free recall</h3>
+<div class="recall">
+<p>A teammate @-mentions your agent in Slack. Write every stage that mention passes through, from arriving to (maybe) reaching a human, and say what each stage protects against.</p>
+<textarea placeholder="Type from memory, then reveal…"></textarea>
+<button class="reveal">Reveal model answer</button>
+<div class="answer">
+<ol>
+<li><strong>Trigger</strong>: the Slack event arrives and records its source (Slack, not the owner), so the agent knows who asked.</li>
+<li><strong>Router</strong>: drops it if it's a retry it has already seen, and maps it to the right conversation.</li>
+<li><strong>Conversation queue</strong>: it waits if a turn is already running there. Several quick messages can be batched into one turn.</li>
+<li><strong>Agent process wakes</strong>: it loads state from the database and runs model → tools → repeat, saving every step. The computer is restored only if a tool needs it.</li>
+<li><strong>Anything worth saying?</strong> If yes, it calls the send tool, which routes the message to Slack. If no, it stays quiet.</li>
+<li><strong>Sleep</strong>: the process stops after about 2 idle minutes. Everything is already saved.</li>
+</ol>
+</div>
+</div>
+
+<hr>
+<div class="callout primary-source">
+<p class="label">Primary source</p>
+<p><a href="https://youtu.be/L1OBRtfPS34">Lee Robinson, “How always-on agents work,” Stanford CS146S, Oct 8 2026</a>. Watch Part 3, “Inside an always-on agent,” with this lesson's two diagrams in front of you.</p>
+</div>
+
+<div class="callout">
+<p class="label">Ask your teacher</p>
+<p>Stuck on anything, or want to push further? Ask me in the terminal. For example: “How would I dedupe Slack retries in TypeScript?” or “What does it cost if a VM wakes for every message?”</p>
+</div>
+
+<ol class="sources">
+<li id="s1">Robinson, lecture slide “You built this in week one.”</li>
+<li id="s2">Robinson, slide “How does it stay always on?”</li>
+<li id="s3">Robinson, slide “Save everything on the server.”</li>
+<li id="s4">Robinson, slide “Open problems you could work on.”</li>
+<li id="s5">Robinson, slide “What wakes the agent.”</li>
+<li id="s6">Robinson, slide “One tool for talking to you.”</li>
+<li id="s7">xAI, <a href="https://docs.x.ai/grok-bot/skills-routines-and-automations">Grok Bot: skills, routines and automations</a>.</li>
+<li id="s8">Anthropic Engineering, <a href="https://www.anthropic.com/engineering/managed-agents">Managed Agents</a>.</li>
+<li id="s9">OpenClaw, <a href="https://github.com/openclaw/openclaw/blob/main/docs/gateway/heartbeat.md">docs/gateway/heartbeat.md</a>.</li>
+</ol>
+
+<div class="next"><a href="../reference/always-on-architecture.html">Architecture cheat sheet</a><a href="0002-three-ways-to-wake.html">Lesson 2: Three ways to wake →</a></div>
+</main>
+</body>
+</html>

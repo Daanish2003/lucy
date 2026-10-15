@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 3 · The conversation queue</title>
+<link rel="stylesheet" href="../assets/course.css">
+<script src="../assets/quiz.js" defer></script>
+</head>
+<body>
+<main>
+<nav class="crumbs"><a href="../MISSION.md">Mission</a> · <a href="0002-three-ways-to-wake.html">Lesson 2</a> · Lesson 3 · <a href="../reference/always-on-architecture.html">Cheat sheet</a></nav>
+
+<h1>The conversation queue</h1>
+<p class="subtitle">Your first piece of the product: the code that decides <em>when</em> a turn runs and <em>what</em> it sees. Built test-first.</p>
+
+<h2>Warm-up</h2>
+<div class="quiz">
+  <div class="q" data-answer="2">
+    <p class="prompt">A. (Lesson 2) A source can't push, so you check it every hour. Which mechanism is that?</p>
+    <button class="opt">An event trigger</button>
+    <button class="opt">A periodic heartbeat</button>
+    <button class="opt">A fixed schedule</button>
+    <button class="opt">A webhook subscription</button>
+    <div class="why">Polling is a schedule with an explicit saved prompt. The heartbeat is reserved for the open-ended “does anything need me?”</div>
+  </div>
+  <div class="q" data-answer="0">
+    <p class="prompt">B. (Lesson 1) Why is it safe for a client to retry sending a message?</p>
+    <button class="opt">Every message carries a unique ID</button>
+    <button class="opt">The model ignores repeated messages</button>
+    <button class="opt">Queues hold only one message</button>
+    <button class="opt">The server waits before saving</button>
+    <div class="why">The server drops any ID it has already seen. That's the dedupe you'll implement below.</div>
+  </div>
+  <p class="quiz-score"></p>
+</div>
+
+<h2>Four rules for new messages</h2>
+<p>Turns take seconds or minutes, and messages keep arriving while one runs. The lecture's rules for that:<sup class="cite"><a href="#s1">1</a></sup></p>
+<ol>
+<li><strong>Drop duplicates.</strong> Each message has a unique ID, and the server drops any ID it has already seen. <em>“Unique IDs make retries safe.”</em></li>
+<li><strong>One turn at a time per conversation.</strong> Different conversations still run in parallel.</li>
+<li><strong>Batch what arrives meanwhile.</strong> <em>“3 quick messages → 1 turn.”</em> “Add Maya?” “And Jordan” “Thanks!” become one turn, not three.</li>
+<li><strong>The owner skips the line.</strong> Your own 1:1 messages and the Stop button <em>“interrupt or stop the turn.”</em> Group chats, Slack, routines and helpers wait at the back.</li>
+</ol>
+
+<figure>
+<svg viewBox="0 0 640 200" role="img" aria-label="Owner messages skip the line into the running turn; everyone else waits in a FIFO queue and is batched.">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker></defs>
+  <text x="0" y="34" class="lbl">You (1:1)</text>
+  <rect x="90" y="16" width="170" height="28" rx="3" class="box"/><text x="175" y="35" text-anchor="middle" class="sm">“Actually, make it Thursday”</text>
+  <rect x="270" y="16" width="60" height="28" rx="3" style="fill:var(--fg)"/><text x="300" y="35" text-anchor="middle" class="lbl" style="fill:var(--bg)">■ Stop</text>
+  <path d="M330,30 C420,30 440,80 480,92" class="edge hot" marker-end="url(#ah)"/><text x="400" y="26" class="sm">skips the line</text>
+  <text x="0" y="128" class="lbl">Everyone else</text>
+  <rect x="90" y="110" width="78" height="28" rx="3" class="box"/><text x="129" y="129" text-anchor="middle" class="sm">helper done</text>
+  <rect x="174" y="110" width="70" height="28" rx="3" class="box"/><text x="209" y="129" text-anchor="middle" class="sm">Slack reply</text>
+  <rect x="250" y="104" width="150" height="40" rx="3" class="box" stroke-dasharray="4 3"/><text x="325" y="121" text-anchor="middle" class="sm">“Add Maya?” “And Jordan”</text><text x="325" y="136" text-anchor="middle" class="sm">“Thanks!” → 1 turn</text>
+  <line x1="400" y1="124" x2="478" y2="110" class="edge" marker-end="url(#ah)"/>
+  <rect x="480" y="80" width="155" height="44" rx="3" class="box hot"/><text x="557" y="99" text-anchor="middle" class="lbl">Running turn</text><text x="557" y="115" text-anchor="middle" class="sm">one batch at a time</text>
+  <text x="90" y="170" class="sm">back of the line ←</text><text x="400" y="170" class="sm" text-anchor="end">→ front</text>
+</svg>
+<figcaption>Redrawn from the lecture slide “Rules for handling new messages.”</figcaption>
+</figure>
+
+<h2>Steer, collect, interrupt, stop</h2>
+<p>OpenClaw names four separate behaviours for a message that arrives during a turn. Its per-session lane runs one turn at a time, and every mode starts from that.<sup class="cite"><a href="#s2">2</a></sup></p>
+<div class="table-wrap"><table>
+<tr><th>Mode</th><th>What happens to the running turn</th></tr>
+<tr><td><strong>collect</strong></td><td>Keeps running. Queued messages are merged into <em>one</em> follow-up turn after a short quiet window (500 ms debounce by default).</td></tr>
+<tr><td><strong>followup</strong></td><td>Keeps running. Each queued message gets its own later turn.</td></tr>
+<tr><td><strong>steer</strong> (OpenClaw's default)</td><td>Keeps running. The new message is <em>injected</em> at the next model boundary. A tool that's already running finishes, but the tool calls it hasn't started yet are skipped.</td></tr>
+<tr><td><strong>interrupt</strong> / stop</td><td>Aborted. Then the newest message runs.</td></tr>
+</table></div>
+<p>Steering is the most polished option, but it lives <em>inside</em> the agent loop. Today you're building the layer underneath: the router and queue. Here, the owner's message <em>interrupts</em>, which is the lecture's rule and the simplest correct version. We'll add steering when we build the turn itself.</p>
+
+<div class="callout">
+<p class="label">The subtle one</p>
+<p>Aborting a turn does <em>not</em> mean you can start the next one right away. The aborted turn may be in the middle of a tool call or a save. If the next turn starts before it settles, you have two turns on one conversation, which is exactly the race rule 2 exists to prevent. Wait for the aborted turn to finish, then start. This is safe because <em>“every step is saved to the database”</em>:<sup class="cite"><a href="#s1">1</a></sup> an aborted turn leaves a valid record of what it did, up to the point it stopped.</p>
+</div>
+
+<hr>
+<h2>Exercise: build the router</h2>
+<p>The repo has a starter that behaves like your week-one agent: every wake immediately runs its own turn. Seven tests describe the four rules. Five of them fail.</p>
+<pre><code>build/01-router/router.ts        ← edit this
+build/01-router/router.test.ts   ← the spec (don't edit)
+
+node --test build/01-router/router.test.ts</code></pre>
+<p>The contract:</p>
+<pre><code>createRouter(runTurn) → { submit(wake): boolean }   // false = dropped as duplicate
+runTurn(conversationId, batch: Wake[], signal: AbortSignal): Promise&lt;void&gt;</code></pre>
+<p>Make the tests pass one at a time, in this order: dedupe → serialize → batch → owner skips the line → wait for the aborted turn to settle. It should take about 30–40 lines. Node 24 runs the <code>.ts</code> files directly, with no dependencies.</p>
+
+<details>
+<summary>Hint 1: the data structure</summary>
+<p>Keep a <code>Set</code> of seen IDs, plus a <code>Map&lt;conversationId, { pending: Wake[], running: AbortController | null, draining: boolean }&gt;</code>.</p>
+</details>
+<details>
+<summary>Hint 2: the loop</summary>
+<p>A single <code>async drain(conversationId)</code> per conversation: <code>while (pending.length) { const batch = pending.splice(0); await runTurn(...) }</code>. Start it only if that conversation isn't already draining. Wrapping the <code>await</code> in <code>try/catch</code> gives you rule 5 for free.</p>
+</details>
+<details>
+<summary>Hint 3: owner ordering</summary>
+<p>Insert owner wakes after the last owner wake already in <code>pending</code> (<code>findLastIndex</code>), then call <code>running?.abort()</code>.</p>
+</details>
+<p>When all seven pass, compare your code with <code>build/solutions/01-router.ts</code>, or paste your code to me for a review.</p>
+
+<h3>Free recall, after the exercise</h3>
+<div class="recall">
+<p>Without looking: why does an owner message abort the turn, while a Slack reply waits? And what would go wrong in a <em>multi-user</em> Slack channel if every human there could abort turns?</p>
+<textarea placeholder="Type from memory…"></textarea>
+<button class="reveal">Reveal model answer</button>
+<div class="answer">
+<p>The owner is the one person who's directing the work. Their new message usually makes the current turn wrong (“actually, Thursday”), so carrying on wastes money and produces stale output. Other inputs are information that can wait a few seconds for the next batch. If everyone in a busy channel could interrupt, the agent would be aborted over and over and never finish a turn. It's a denial of service carried out by ordinary chat. That's why the rule is tied to <em>who</em> sent the message (<code>source: "owner"</code> and <code>trusted</code>), not to where it was sent.</p>
+</div>
+</div>
+
+<hr>
+<div class="callout primary-source">
+<p class="label">Primary source</p>
+<p><a href="https://github.com/openclaw/openclaw/blob/main/docs/concepts/queue.md">OpenClaw: docs/concepts/queue.md</a>. It's short and covers a real system's queue modes, defaults and lanes. Read it after the exercise and compare it with your router. For more, read <a href="https://github.com/openclaw/openclaw/blob/main/docs/concepts/queue-steering.md">queue-steering.md</a> for how steering skips unstarted tool calls.</p>
+</div>
+
+<div class="callout">
+<p class="label">Ask your teacher</p>
+<p>For example: “My seen-ID Set grows forever. How would this work with Postgres?”, “How do I run this router across several servers?”, or “Show me how steering would plug into the agent loop.”</p>
+</div>
+
+<ol class="sources">
+<li id="s1">Robinson, lecture slides “What happens when you hit send” and “Rules for handling new messages.”</li>
+<li id="s2">OpenClaw, <a href="https://github.com/openclaw/openclaw/blob/main/docs/concepts/queue.md">docs/concepts/queue.md</a> and <a href="https://github.com/openclaw/openclaw/blob/main/docs/concepts/queue-steering.md">queue-steering.md</a>.</li>
+</ol>
+
+<div class="next"><a href="0002-three-ways-to-wake.html">← Lesson 2</a><a href="../reference/always-on-architecture.html">Cheat sheet →</a></div>
+</main>
+</body>
+</html>
